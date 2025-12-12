@@ -16,11 +16,10 @@ import platform
 import sys
 from pathlib import Path
 from typing import (
+    IO,
     Any,
     Callable,
-    cast,
     Dict,
-    IO,
     Iterable,
     List,
     Optional,
@@ -28,6 +27,7 @@ from typing import (
     Tuple,
     TypedDict,
     Union,
+    cast,
 )
 
 from . import ninja_syntax
@@ -170,7 +170,9 @@ class ProjectConfig:
         self.asflags: Optional[List[str]] = None  # Assembler flags
         self.ldflags: Optional[List[str]] = None  # Linker flags
         self.libs: Optional[List[Library]] = None  # List of libraries
-        self.precompiled_headers: Optional[List[PrecompiledHeader]] = None  # List of precompiled headers
+        self.precompiled_headers: Optional[List[PrecompiledHeader]] = (
+            None  # List of precompiled headers
+        )
         self.linker_version: Optional[str] = None  # mwld version
         self.default_version: Optional[str] = None  # Default version name
         self.versions: List[str] = []  # List of versions
@@ -202,12 +204,12 @@ class ProjectConfig:
         self.link_order_callback: Optional[Callable[[int, List[str]], List[str]]] = (
             None  # Callback to add/remove/reorder units within a module
         )
-        self.context_exclude_globs: List[str] = (
-            []  # Globs to exclude from context files
-        )
-        self.context_defines: List[str] = (
-            []  # Macros to define at the top of context files
-        )
+        self.context_exclude_globs: List[
+            str
+        ] = []  # Globs to exclude from context files
+        self.context_defines: List[
+            str
+        ] = []  # Macros to define at the top of context files
 
         # Progress output and report.json config
         self.progress = True  # Enable report.json generation and CLI progress output
@@ -291,8 +293,8 @@ class ProjectConfig:
     def use_wibo(self) -> bool:
         return (
             self.wibo_tag is not None
-            and sys.platform == "linux"
-            and platform.machine() in ("i386", "x86_64")
+            and (sys.platform == "linux" or sys.platform == "darwin")
+            and platform.machine() in ("i386", "x86_64", "aarch64", "arm64")
             and self.wrapper is None
         )
     
@@ -636,10 +638,7 @@ def generate_build_ninja(
         sys.exit("ProjectConfig.sjiswrap_tag missing")
 
     wrapper = config.compiler_wrapper()
-    # Only add an implicit dependency on wibo if we download it
-    wrapper_implicit: Optional[Path] = None
     if wrapper is not None and config.use_wibo():
-        wrapper_implicit = wrapper
         n.build(
             outputs=wrapper,
             rule="download_tool",
@@ -649,6 +648,11 @@ def generate_build_ninja(
                 "tag": config.wibo_tag,
             },
         )
+
+    wrapper_implicit: Optional[Path] = None
+    if wrapper is not None and (wrapper.exists() or config.use_wibo()):
+        wrapper_implicit = wrapper
+
     wrapper_cmd = f"{wrapper} " if wrapper else ""
 
     compilers = config.compilers()
@@ -719,9 +723,11 @@ def generate_build_ninja(
     mwcc_pch_sjis_implicit: List[Optional[Path]] = [*mwcc_implicit, sjiswrap]
 
     # MWCC with extab post-processing
-    mwcc_extab_cmd = f"{CHAIN}{mwcc_cmd} && {dtk} extab clean --padding \"$extab_padding\" $out $out"
+    mwcc_extab_cmd = (
+        f'{CHAIN}{mwcc_cmd} && {dtk} extab clean --padding "$extab_padding" $out $out'
+    )
     mwcc_extab_implicit: List[Optional[Path]] = [*mwcc_implicit, dtk]
-    mwcc_sjis_extab_cmd = f"{CHAIN}{mwcc_sjis_cmd} && {dtk} extab clean --padding \"$extab_padding\" $out $out"
+    mwcc_sjis_extab_cmd = f'{CHAIN}{mwcc_sjis_cmd} && {dtk} extab clean --padding "$extab_padding" $out $out'
     mwcc_sjis_extab_implicit: List[Optional[Path]] = [*mwcc_sjis_implicit, dtk]
 
     # MWLD
@@ -860,7 +866,11 @@ def generate_build_ninja(
         )
         n.newline()
 
-    def write_custom_step(step: str, prev_step: Optional[str] = None, extra_inputs: Optional[List[str]] = None) -> None:
+    def write_custom_step(
+        step: str,
+        prev_step: Optional[str] = None,
+        extra_inputs: Optional[List[str]] = None,
+    ) -> None:
         implicit: List[Union[str, Path]] = []
         if config.custom_build_steps and step in config.custom_build_steps:
             n.comment(f"Custom build steps ({step})")
@@ -1023,11 +1033,12 @@ def generate_build_ninja(
                         cflags.insert(0, "-lang=c")
 
                 cflags_str = make_flags_str(cflags)
+                shift_jis = pch.get("shift_jis", config.shift_jis)
 
                 n.comment(f"Precompiled header {pch_out_name}")
                 n.build(
                     outputs=pch_out_abs_path,
-                    rule="mwcc_pch_sjis" if pch.get("shift_jis", config.shift_jis) else "mwcc_pch",
+                    rule="mwcc_pch_sjis" if shift_jis else "mwcc_pch",
                     inputs=f"include/{src_path_rel_str}",
                     variables={
                         "mw_version": Path(pch["mw_version"]),
@@ -1036,7 +1047,7 @@ def generate_build_ninja(
                         "basefile": pch_out_abs_path.with_suffix(""),
                         "basefilestem": pch_out_abs_path.stem,
                     },
-                    implicit=[*mwcc_implicit],
+                    implicit=mwcc_pch_sjis_implicit if shift_jis else mwcc_pch_implicit,
                 )
                 n.newline()
 
@@ -1080,14 +1091,18 @@ def generate_build_ninja(
             if obj.options["shift_jis"] and obj.options["extab_padding"] is not None:
                 build_rule = "mwcc_sjis_extab"
                 build_implcit = mwcc_sjis_extab_implicit
-                variables["extab_padding"] = "".join(f"{i:02x}" for i in obj.options["extab_padding"])
+                variables["extab_padding"] = "".join(
+                    f"{i:02x}" for i in obj.options["extab_padding"]
+                )
             elif obj.options["shift_jis"]:
                 build_rule = "mwcc_sjis"
                 build_implcit = mwcc_sjis_implicit
             elif obj.options["extab_padding"] is not None:
                 build_rule = "mwcc_extab"
                 build_implcit = mwcc_extab_implicit
-                variables["extab_padding"] = "".join(f"{i:02x}" for i in obj.options["extab_padding"])
+                variables["extab_padding"] = "".join(
+                    f"{i:02x}" for i in obj.options["extab_padding"]
+                )
             n.comment(f"{obj.name}: {lib_name} (linked {obj.completed(version)})")
             n.build(
                 outputs=obj.src_obj_path,
